@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Babylon.js × 音声認識：しゃべると3D文字が飛ぶ（改良版・権限対策）</title>
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    html, body { height: 100%; margin: 0; background:#0b1020; color:#e7ecff; font-family: 'Noto Sans JP', system-ui, -apple-system, Segoe UI, Roboto, 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif; }
+    #app { display: grid; grid-template-rows: auto 1fr auto; height: 100%; }
+    header { padding: .75rem 1rem; display:flex; align-items:center; gap: .75rem; border-bottom: 1px solid rgba(255,255,255,.08); flex-wrap:wrap }
+    header h1 { font-size: 1rem; margin: 0; opacity:.9; letter-spacing:.02em; }
+    .controls { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap }
+    button { all:unset; cursor:pointer; background:#243056; padding:.5rem .8rem; border-radius:.7rem; border:1px solid rgba(255,255,255,.12); }
+    button:hover { background:#2d3a67; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .chip { font-size:.8rem; opacity:.8 }
+    #renderCanvas { width: 100%; height: 100%; touch-action:none; display:block; }
+    footer { padding:.5rem 1rem; font-size:.85rem; opacity:.9; border-top:1px solid rgba(255,255,255,.08) }
+    .warn { background:#3a1620; color:#ffd6de; border-bottom:1px solid rgba(255,255,255,.12); padding:.55rem 1rem; font-size:.9rem }
+    .ok   { color:#a6ffcf }
+    input.data { padding:.4rem .6rem; background:#1a2240; border:1px solid rgba(255,255,255,.15); border-radius:.6rem; color:#e7ecff; width:min(520px, 80vw); }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="topWarn" class="warn" style="display:none"></div>
+    <header>
+      <h1>🎤 Babylon.js × 音声認識：声が3D文字になって飛ぶ</h1>
+      <div class="controls">
+        <button id="btnStart">▶ 音声認識スタート</button>
+        <button id="btnStop" disabled>■ ストップ</button>
+        <span class="chip" id="langChip">lang: ja-JP</span>
+        <span class="chip" id="hint">ヒント：『こんにちは』と言ってみて</span>
+      </div>
+      <div class="controls" style="margin-left:auto">
+        <input id="textInput" class="data" type="text" placeholder="ここに文字を打って Enter で飛ばす" />
+      </div>
+    </header>
+
+    <canvas id="renderCanvas"></canvas>
+
+    <footer>
+      <div id="supportInfo"></div>
+    </footer>
+  </div>
+
+  <script>
+  // ====== 環境チェック ======
+  const isIframe = window.top !== window.self;
+  const isSecure = window.isSecureContext;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const support = { speech: !!SR, media: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia), secure: isSecure, iframe: isIframe };
+  const topWarn = document.getElementById('topWarn');
+  const supportInfo = document.getElementById('supportInfo');
+  const hint = document.getElementById('hint');
+
+  function showSupportInfo(){
+    supportInfo.innerHTML = 'サポート状況 → 音声認識: ' + (support.speech ? '<b class="ok">OK</b>' : '<b>未対応</b>') + ' / getUserMedia: ' + (support.media ? '<b class="ok">OK</b>' : '<b>未対応</b>') + ' / セキュア環境(https): ' + (support.secure ? '<b class="ok">OK</b>' : '<b>NG</b>') + ' / iframe内: <b>' + (support.iframe ? 'Yes' : 'No') + '</b>';
+    if (!support.speech) {
+      topWarn.style.display = '';
+      topWarn.textContent = 'この環境はWeb Speech API（音声認識）に未対応です。Chromeデスクトップ推奨。テキスト入力で代用できます。';
+    } else if (!support.secure || support.iframe) {
+      topWarn.style.display = '';
+      topWarn.textContent = 'プレビュー/iframe環境ではマイク許可がブロックされる場合があります。可能ならローカルのhttp(s)サーバで実行してください。';
+    }
+  }
+  showSupportInfo();
+
+  // ====== Babylon.js ======
+  const canvas = document.getElementById('renderCanvas');
+  const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer:true, stencil:true, disableWebGL2Support:false });
+  function createScene(){
+    const scene = new BABYLON.Scene(engine);
+    scene.clearColor = new BABYLON.Color4(0.04, 0.06, 0.12, 1);
+    const camera = new BABYLON.ArcRotateCamera('cam', Math.PI/2, Math.PI/3, 12, new BABYLON.Vector3(0,1,0), scene);
+    camera.attachControl(canvas, true);
+    camera.lowerRadiusLimit = 6; camera.upperRadiusLimit = 40;
+    const light1 = new BABYLON.HemisphericLight('hemi', new BABYLON.Vector3(0,1,0), scene); light1.intensity = 0.7;
+    const light2 = new BABYLON.DirectionalLight('dir', new BABYLON.Vector3(-1,-2,-1), scene); light2.intensity = 0.6;
+    const ground = BABYLON.MeshBuilder.CreateGround('ground', {width:60, height:60, subdivisions:2}, scene);
+    const gMat = new BABYLON.StandardMaterial('gMat', scene);
+    gMat.diffuseColor = new BABYLON.Color3(0.05,0.08,0.18);
+    gMat.specularColor = BABYLON.Color3.Black();
+    gMat.emissiveColor = new BABYLON.Color3(0.05,0.08,0.20);
+    ground.material = gMat;
+    const points = [];
+    for (let i=0;i<200;i++){ points.push(new BABYLON.Vector3((Math.random()-0.5)*80, Math.random()*20+2, (Math.random()-0.5)*80)); }
+    const ps = BABYLON.MeshBuilder.CreatePointCloud('stars', {points}, scene);
+    const psMat = new BABYLON.StandardMaterial('psMat', scene);
+    psMat.emissiveColor = new BABYLON.Color3(0.5,0.7,1);
+    ps.material = psMat; ps.alwaysSelectAsActiveMesh = true;
+    return scene;
+  }
+  const scene = createScene();
+  engine.runRenderLoop(() => scene.render());
+  window.addEventListener('resize', () => engine.resize());
+
+  // ====== 3D文字生成 ======
+  function spawnTextBillboard(text, scene, options){
+    const opts = Object.assign({ fontSize: 96, fontWeight: '700', padding: 24, background: 'rgba(0,0,0,0)', fillStyle: '#e7ecff', strokeStyle: 'rgba(150,180,255,0.35)', strokeWidth: 4, maxWidth: 1024, billboard: true, lifeMs: 3000, speed: 6, spread: 1.2, fromCamera: true }, options||{});
+    const dt = new BABYLON.DynamicTexture('dt', {width:opts.maxWidth, height:256}, scene, false);
+    const ctx = dt.getContext();
+    ctx.font = opts.fontWeight + ' ' + opts.fontSize + 'px ' + "'Noto Sans JP', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', sans-serif";
+    const metrics = ctx.measureText(text);
+    const textW = Math.min(opts.maxWidth - opts.padding*2, Math.ceil(metrics.width));
+    const textH = opts.fontSize + opts.padding*2;
+    dt.scaleTo(Math.max(2, textW + opts.padding*2), Math.max(2, textH));
+    const ctx2 = dt.getContext();
+    ctx2.clearRect(0,0,dt.getSize().width, dt.getSize().height);
+    if (opts.background && opts.background !== 'transparent') { ctx2.fillStyle = opts.background; ctx2.fillRect(0,0,dt.getSize().width, dt.getSize().height); }
+    ctx2.font = ctx.font; ctx2.textBaseline = 'middle'; ctx2.textAlign = 'left';
+    const x = opts.padding, y = dt.getSize().height/2;
+    if (opts.strokeWidth>0){ ctx2.lineWidth = opts.strokeWidth; ctx2.strokeStyle = opts.strokeStyle; ctx2.strokeText(text, x, y); }
+    ctx2.fillStyle = opts.fillStyle; ctx2.fillText(text, x, y);
+    dt.update();
+    const plane = BABYLON.MeshBuilder.CreatePlane('txt', { width: dt.getSize().width/100, height: dt.getSize().height/100 }, scene);
+    const mat = new BABYLON.StandardMaterial('txtMat', scene);
+    mat.diffuseTexture = dt; mat.emissiveColor = new BABYLON.Color3(1,1,1); mat.specularColor = BABYLON.Color3.Black(); mat.backFaceCulling = false; mat.transparencyMode = BABYLON.Material.MATERIAL_ALPHABLEND; plane.material = mat;
+    if (opts.billboard) plane.billboardMode = BABYLON.Mesh.BILLBOARDMODE_Y;
+    const cam = scene.activeCamera; const forward = cam.getFrontPosition(1).subtract(cam.position).normalize();
+    const startPos = opts.fromCamera ? cam.position.add(forward.scale(2)).add(new BABYLON.Vector3((Math.random()-0.5)*0.5, 0.2, (Math.random()-0.5)*0.5)) : new BABYLON.Vector3(0,1.4,0);
+    plane.position = startPos;
+    const side = BABYLON.Vector3.Cross(forward, new BABYLON.Vector3(0,1,0)).normalize(); const up = new BABYLON.Vector3(0,1,0);
+    const dir = forward.add(side.scale((Math.random()-0.5)*opts.spread)).add(up.scale(Math.random()*opts.spread)).normalize();
+    const startTime = performance.now(); const startScale = 0.7 + Math.random()*0.3; plane.scaling.set(startScale, startScale, startScale);
+    const observer = scene.onBeforeRenderObservable.add(function(){
+      const t = performance.now() - startTime; const dtSec = engine.getDeltaTime()/1000; plane.position.addInPlace(dir.scale(opts.speed*dtSec));
+      const k = t/opts.lifeMs; plane.scaling.setAll(startScale + k*0.8); mat.alpha = 1 - k;
+      if (t >= opts.lifeMs){ scene.onBeforeRenderObservable.remove(observer); plane.dispose(false,true); dt.dispose(); }
+    });
+    return plane;
+  }
+
+  // ====== 音声認識 ======
+  const btnStart = document.getElementById('btnStart');
+  const btnStop  = document.getElementById('btnStop');
+  const textInput = document.getElementById('textInput');
+  let recog = null; let listening = false;
+
+  function setupRecognition(){
+    if (!SR) return null;
+    const r = new SR();
+    r.lang = 'ja-JP'; r.interimResults = true; r.continuous = true;
+    let interimText = '';
+    r.onstart = function(){ hint.textContent = '聴き取り中…（話しかけてね）'; };
+    r.onend = function(){ if (listening) { try { r.start(); } catch(e){} } else { hint.textContent = '停止中。▶で開始'; } };
+    r.onresult = function(ev){
+      let finalText = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++){
+        const res = ev.results[i]; const t = res[0].transcript.trim();
+        if (res.isFinal) finalText += t + ' '; else interimText = t;
+      }
+      if (finalText){ spawnTextBillboard(finalText.trim(), scene, { lifeMs: 2600 }); }
+      if (interimText){ spawnTextBillboard(interimText, scene, { fillStyle:'#bcd2ff', strokeStyle:'rgba(140,170,255,.2)', lifeMs: 900, speed: 3, fontWeight:'400' }); interimText=''; }
+    };
+    r.onerror = function(e){ hint.textContent = '音声認識エラー：' + e.error; toggleListening(false); };
+    return r;
+  }
+
+  async function startRecognition(){
+    if (support.media){
+      try { const stream = await navigator.mediaDevices.getUserMedia({ audio: true }); stream.getTracks().forEach(function(t){ t.stop(); }); }
+      catch (e) { hint.textContent = 'マイク許可が必要です：' + e.name; return; }
+    }
+    if (!recog) recog = setupRecognition();
+    if (!recog){ hint.textContent = 'このブラウザは音声認識に未対応です。テキスト欄をご利用ください。'; return; }
+    toggleListening(true);
+  }
+
+  function toggleListening(on){
+    listening = on; btnStart.disabled = on; btnStop.disabled = !on;
+    try { if (on) recog.start(); else recog.stop(); } catch(e){}
+  }
+
+  btnStart.addEventListener('click', function(){ startRecognition(); });
+  btnStop.addEventListener('click', function(){ toggleListening(false); });
+
+  // テキスト入力でも飛ばせる（常時有効）
+  textInput.addEventListener('keydown', function(e){
+    if (e.key === 'Enter'){
+      const txt = textInput.value.trim(); if (txt){ spawnTextBillboard(txt, scene, { lifeMs: 2600 }); textInput.value=''; }
+    }
+  });
+
+  // 初回デモ
+  setTimeout(function(){ spawnTextBillboard('こんにちは', scene, { lifeMs: 2200 }); }, 400);
+  </script>
+</body>
+</html>
